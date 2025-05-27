@@ -1,17 +1,19 @@
 package pgx_test
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgconn/stmtcache"
-	"github.com/jackc/pgtype"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxtest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -81,7 +83,7 @@ func TestConnectWithPreferSimpleProtocol(t *testing.T) {
 	t.Parallel()
 
 	connConfig := mustParseConfig(t, os.Getenv("PGX_TEST_DATABASE"))
-	connConfig.PreferSimpleProtocol = true
+	connConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
 	conn := mustConnect(t, connConfig)
 	defer closeConn(t, conn)
@@ -91,13 +93,8 @@ func TestConnectWithPreferSimpleProtocol(t *testing.T) {
 
 	var s pgtype.Text
 	err := conn.QueryRow(context.Background(), "select $1::int4", 42).Scan(&s)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if s.Get() != "42" {
-		t.Fatalf(`expected "42", got %v`, s)
-	}
+	require.NoError(t, err)
+	require.Equal(t, pgtype.Text{String: "42", Valid: true}, s)
 
 	ensureConnValid(t, conn)
 }
@@ -142,71 +139,146 @@ func TestParseConfigExtractsStatementCacheOptions(t *testing.T) {
 
 	config, err := pgx.ParseConfig("statement_cache_capacity=0")
 	require.NoError(t, err)
-	require.Nil(t, config.BuildStatementCache)
+	require.EqualValues(t, 0, config.StatementCacheCapacity)
 
 	config, err = pgx.ParseConfig("statement_cache_capacity=42")
 	require.NoError(t, err)
-	require.NotNil(t, config.BuildStatementCache)
-	c := config.BuildStatementCache(nil)
-	require.NotNil(t, c)
-	require.Equal(t, 42, c.Cap())
-	require.Equal(t, stmtcache.ModePrepare, c.Mode())
+	require.EqualValues(t, 42, config.StatementCacheCapacity)
 
-	config, err = pgx.ParseConfig("statement_cache_capacity=42 statement_cache_mode=prepare")
+	config, err = pgx.ParseConfig("description_cache_capacity=0")
 	require.NoError(t, err)
-	require.NotNil(t, config.BuildStatementCache)
-	c = config.BuildStatementCache(nil)
-	require.NotNil(t, c)
-	require.Equal(t, 42, c.Cap())
-	require.Equal(t, stmtcache.ModePrepare, c.Mode())
+	require.EqualValues(t, 0, config.DescriptionCacheCapacity)
 
-	config, err = pgx.ParseConfig("statement_cache_capacity=42 statement_cache_mode=describe")
+	config, err = pgx.ParseConfig("description_cache_capacity=42")
 	require.NoError(t, err)
-	require.NotNil(t, config.BuildStatementCache)
-	c = config.BuildStatementCache(nil)
-	require.NotNil(t, c)
-	require.Equal(t, 42, c.Cap())
-	require.Equal(t, stmtcache.ModeDescribe, c.Mode())
+	require.EqualValues(t, 42, config.DescriptionCacheCapacity)
+
+	//	default_query_exec_mode
+	//		Possible values: "cache_statement", "cache_describe", "describe_exec", "exec", and "simple_protocol". See
+
+	config, err = pgx.ParseConfig("default_query_exec_mode=cache_statement")
+	require.NoError(t, err)
+	require.Equal(t, pgx.QueryExecModeCacheStatement, config.DefaultQueryExecMode)
+
+	config, err = pgx.ParseConfig("default_query_exec_mode=cache_describe")
+	require.NoError(t, err)
+	require.Equal(t, pgx.QueryExecModeCacheDescribe, config.DefaultQueryExecMode)
+
+	config, err = pgx.ParseConfig("default_query_exec_mode=describe_exec")
+	require.NoError(t, err)
+	require.Equal(t, pgx.QueryExecModeDescribeExec, config.DefaultQueryExecMode)
+
+	config, err = pgx.ParseConfig("default_query_exec_mode=exec")
+	require.NoError(t, err)
+	require.Equal(t, pgx.QueryExecModeExec, config.DefaultQueryExecMode)
+
+	config, err = pgx.ParseConfig("default_query_exec_mode=simple_protocol")
+	require.NoError(t, err)
+	require.Equal(t, pgx.QueryExecModeSimpleProtocol, config.DefaultQueryExecMode)
+}
+
+func TestParseConfigExtractsDefaultQueryExecMode(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		connString           string
+		defaultQueryExecMode pgx.QueryExecMode
+	}{
+		{"", pgx.QueryExecModeCacheStatement},
+		{"default_query_exec_mode=cache_statement", pgx.QueryExecModeCacheStatement},
+		{"default_query_exec_mode=cache_describe", pgx.QueryExecModeCacheDescribe},
+		{"default_query_exec_mode=describe_exec", pgx.QueryExecModeDescribeExec},
+		{"default_query_exec_mode=exec", pgx.QueryExecModeExec},
+		{"default_query_exec_mode=simple_protocol", pgx.QueryExecModeSimpleProtocol},
+	} {
+		config, err := pgx.ParseConfig(tt.connString)
+		require.NoError(t, err)
+		require.Equalf(t, tt.defaultQueryExecMode, config.DefaultQueryExecMode, "connString: `%s`", tt.connString)
+		require.Empty(t, config.RuntimeParams["default_query_exec_mode"])
+	}
+}
+
+func TestParseConfigErrors(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		connString           string
+		expectedErrSubstring string
+	}{
+		{"default_query_exec_mode=does_not_exist", "does_not_exist"},
+	} {
+		config, err := pgx.ParseConfig(tt.connString)
+		require.Nil(t, config)
+		require.ErrorContains(t, err, tt.expectedErrSubstring)
+	}
 }
 
 func TestExec(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		if results := mustExec(t, conn, "create temporary table foo(id integer primary key);"); string(results) != "CREATE TABLE" {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		if results := mustExec(t, conn, "create temporary table foo(id integer primary key);"); results.String() != "CREATE TABLE" {
 			t.Error("Unexpected results from Exec")
 		}
 
 		// Accept parameters
-		if results := mustExec(t, conn, "insert into foo(id) values($1)", 1); string(results) != "INSERT 0 1" {
+		if results := mustExec(t, conn, "insert into foo(id) values($1)", 1); results.String() != "INSERT 0 1" {
 			t.Errorf("Unexpected results from Exec: %v", results)
 		}
 
-		if results := mustExec(t, conn, "drop table foo;"); string(results) != "DROP TABLE" {
+		if results := mustExec(t, conn, "drop table foo;"); results.String() != "DROP TABLE" {
 			t.Error("Unexpected results from Exec")
 		}
 
 		// Multiple statements can be executed -- last command tag is returned
-		if results := mustExec(t, conn, "create temporary table foo(id serial primary key); drop table foo;"); string(results) != "DROP TABLE" {
+		if results := mustExec(t, conn, "create temporary table foo(id serial primary key); drop table foo;"); results.String() != "DROP TABLE" {
 			t.Error("Unexpected results from Exec")
 		}
 
 		// Can execute longer SQL strings than sharedBufferSize
-		if results := mustExec(t, conn, strings.Repeat("select 42; ", 1000)); string(results) != "SELECT 1" {
+		if results := mustExec(t, conn, strings.Repeat("select 42; ", 1000)); results.String() != "SELECT 1" {
 			t.Errorf("Unexpected results from Exec: %v", results)
 		}
 
 		// Exec no-op which does not return a command tag
-		if results := mustExec(t, conn, "--;"); string(results) != "" {
+		if results := mustExec(t, conn, "--;"); results.String() != "" {
 			t.Errorf("Unexpected results from Exec: %v", results)
 		}
+	})
+}
+
+type testQueryRewriter struct {
+	sql  string
+	args []any
+}
+
+func (qr *testQueryRewriter) RewriteQuery(ctx context.Context, conn *pgx.Conn, sql string, args []any) (newSQL string, newArgs []any, err error) {
+	return qr.sql, qr.args, nil
+}
+
+func TestExecWithQueryRewriter(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		qr := testQueryRewriter{sql: "select $1::int", args: []any{42}}
+		_, err := conn.Exec(ctx, "should be replaced", &qr)
+		require.NoError(t, err)
 	})
 }
 
 func TestExecFailure(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		if _, err := conn.Exec(context.Background(), "selct;"); err == nil {
 			t.Fatal("Expected SQL syntax error")
 		}
@@ -222,7 +294,10 @@ func TestExecFailure(t *testing.T) {
 func TestExecFailureWithArguments(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
 		_, err := conn.Exec(context.Background(), "selct $1;", 1)
 		if err == nil {
 			t.Fatal("Expected SQL syntax error")
@@ -237,15 +312,18 @@ func TestExecFailureWithArguments(t *testing.T) {
 func TestExecContextWithoutCancelation(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		ctx, cancelFunc := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		ctx, cancelFunc := context.WithCancel(ctx)
 		defer cancelFunc()
 
 		commandTag, err := conn.Exec(ctx, "create temporary table foo(id integer primary key);")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(commandTag) != "CREATE TABLE" {
+		if commandTag.String() != "CREATE TABLE" {
 			t.Fatalf("Unexpected results from Exec: %v", commandTag)
 		}
 		assert.False(t, pgconn.SafeToRetry(err))
@@ -255,8 +333,11 @@ func TestExecContextWithoutCancelation(t *testing.T) {
 func TestExecContextFailureWithoutCancelation(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		ctx, cancelFunc := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		ctx, cancelFunc := context.WithCancel(ctx)
 		defer cancelFunc()
 
 		_, err := conn.Exec(ctx, "selct;")
@@ -277,8 +358,11 @@ func TestExecContextFailureWithoutCancelation(t *testing.T) {
 func TestExecContextFailureWithoutCancelationWithArguments(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		ctx, cancelFunc := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		ctx, cancelFunc := context.WithCancel(ctx)
 		defer cancelFunc()
 
 		_, err := conn.Exec(ctx, "selct $1;", 1)
@@ -300,56 +384,6 @@ func TestExecFailureCloseBefore(t *testing.T) {
 	assert.True(t, pgconn.SafeToRetry(err))
 }
 
-func TestExecStatementCacheModes(t *testing.T) {
-	t.Parallel()
-
-	config := mustParseConfig(t, os.Getenv("PGX_TEST_DATABASE"))
-
-	tests := []struct {
-		name                string
-		buildStatementCache pgx.BuildStatementCacheFunc
-	}{
-		{
-			name:                "disabled",
-			buildStatementCache: nil,
-		},
-		{
-			name: "prepare",
-			buildStatementCache: func(conn *pgconn.PgConn) stmtcache.Cache {
-				return stmtcache.New(conn, stmtcache.ModePrepare, 32)
-			},
-		},
-		{
-			name: "describe",
-			buildStatementCache: func(conn *pgconn.PgConn) stmtcache.Cache {
-				return stmtcache.New(conn, stmtcache.ModeDescribe, 32)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		func() {
-			config.BuildStatementCache = tt.buildStatementCache
-			conn := mustConnect(t, config)
-			defer closeConn(t, conn)
-
-			commandTag, err := conn.Exec(context.Background(), "select 1")
-			assert.NoError(t, err, tt.name)
-			assert.Equal(t, "SELECT 1", string(commandTag), tt.name)
-
-			commandTag, err = conn.Exec(context.Background(), "select 1 union all select 1")
-			assert.NoError(t, err, tt.name)
-			assert.Equal(t, "SELECT 2", string(commandTag), tt.name)
-
-			commandTag, err = conn.Exec(context.Background(), "select 1")
-			assert.NoError(t, err, tt.name)
-			assert.Equal(t, "SELECT 1", string(commandTag), tt.name)
-
-			ensureConnValid(t, conn)
-		}()
-	}
-}
-
 func TestExecPerQuerySimpleProtocol(t *testing.T) {
 	t.Parallel()
 
@@ -363,19 +397,19 @@ func TestExecPerQuerySimpleProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(commandTag) != "CREATE TABLE" {
+	if commandTag.String() != "CREATE TABLE" {
 		t.Fatalf("Unexpected results from Exec: %v", commandTag)
 	}
 
 	commandTag, err = conn.Exec(ctx,
 		"insert into foo(name) values($1);",
-		pgx.QuerySimpleProtocol(true),
+		pgx.QueryExecModeSimpleProtocol,
 		"bar'; drop table foo;--",
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(commandTag) != "INSERT 0 1" {
+	if commandTag.String() != "INSERT 0 1" {
 		t.Fatalf("Unexpected results from Exec: %v", commandTag)
 	}
 
@@ -427,7 +461,7 @@ func TestPrepare(t *testing.T) {
 		t.Errorf("Prepared statement did not return expected value: %v", s)
 	}
 
-	err = conn.Deallocate(context.Background(), "test")
+	err = conn.DeallocateAll(context.Background())
 	if err != nil {
 		t.Errorf("conn.Deallocate failed: %v", err)
 	}
@@ -449,31 +483,135 @@ func TestPrepareBadSQLFailure(t *testing.T) {
 func TestPrepareIdempotency(t *testing.T) {
 	t.Parallel()
 
-	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
-	defer closeConn(t, conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
 
-	for i := 0; i < 2; i++ {
-		_, err := conn.Prepare(context.Background(), "test", "select 42::integer")
-		if err != nil {
-			t.Fatalf("%d. Unable to prepare statement: %v", i, err)
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		for i := 0; i < 2; i++ {
+			_, err := conn.Prepare(context.Background(), "test", "select 42::integer")
+			if err != nil {
+				t.Fatalf("%d. Unable to prepare statement: %v", i, err)
+			}
+
+			var n int32
+			err = conn.QueryRow(context.Background(), "test").Scan(&n)
+			if err != nil {
+				t.Errorf("%d. Executing prepared statement failed: %v", i, err)
+			}
+
+			if n != int32(42) {
+				t.Errorf("%d. Prepared statement did not return expected value: %v", i, n)
+			}
 		}
 
-		var n int32
-		err = conn.QueryRow(context.Background(), "test").Scan(&n)
-		if err != nil {
-			t.Errorf("%d. Executing prepared statement failed: %v", i, err)
+		_, err := conn.Prepare(context.Background(), "test", "select 'fail'::varchar")
+		if err == nil {
+			t.Fatalf("Prepare statement with same name but different SQL should have failed but it didn't")
+			return
 		}
+	})
+}
 
-		if n != int32(42) {
-			t.Errorf("%d. Prepared statement did not return expected value: %v", i, n)
-		}
-	}
+func TestPrepareStatementCacheModes(t *testing.T) {
+	t.Parallel()
 
-	_, err := conn.Prepare(context.Background(), "test", "select 'fail'::varchar")
-	if err == nil {
-		t.Fatalf("Prepare statement with same name but different SQL should have failed but it didn't")
-		return
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Prepare(context.Background(), "test", "select $1::text")
+		require.NoError(t, err)
+
+		var s string
+		err = conn.QueryRow(context.Background(), "test", "hello").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s)
+	})
+}
+
+func TestPrepareWithDigestedName(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		sql := "select $1::text"
+		sd, err := conn.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+
+		var s string
+		err = conn.QueryRow(ctx, sql, "hello").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s)
+
+		err = conn.Deallocate(ctx, sql)
+		require.NoError(t, err)
+	})
+}
+
+// https://github.com/jackc/pgx/pull/1795
+func TestDeallocateInAbortedTransaction(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+
+		sql := "select $1::text"
+		sd, err := tx.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+
+		var s string
+		err = tx.QueryRow(ctx, sql, "hello").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s)
+
+		_, err = tx.Exec(ctx, "select 1/0") // abort transaction with divide by zero error
+		require.Error(t, err)
+
+		err = conn.Deallocate(ctx, sql)
+		require.NoError(t, err)
+
+		err = tx.Rollback(ctx)
+		require.NoError(t, err)
+
+		sd, err = conn.Prepare(ctx, sql, sql)
+		require.NoError(t, err)
+		require.Equal(t, "stmt_2510cc7db17de3f42758a2a29c8b9ef8305d007b997ebdd6", sd.Name)
+	})
+}
+
+func TestDeallocateMissingPreparedStatementStillClearsFromPreparedStatementMap(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Prepare(ctx, "ps", "select $1::text")
+		require.NoError(t, err)
+
+		_, err = conn.Exec(ctx, "deallocate ps")
+		require.NoError(t, err)
+
+		err = conn.Deallocate(ctx, "ps")
+		require.NoError(t, err)
+
+		_, err = conn.Prepare(ctx, "ps", "select $1::text, $2::text")
+		require.NoError(t, err)
+
+		var s1, s2 string
+		err = conn.QueryRow(ctx, "ps", "hello", "world").Scan(&s1, &s2)
+		require.NoError(t, err)
+		require.Equal(t, "hello", s1)
+		require.Equal(t, "world", s2)
+	})
 }
 
 func TestListenNotify(t *testing.T) {
@@ -481,6 +619,10 @@ func TestListenNotify(t *testing.T) {
 
 	listener := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, listener)
+
+	if listener.PgConn().ParameterStatus("crdb_version") != "" {
+		t.Skip("Server does not support LISTEN / NOTIFY (https://github.com/cockroachdb/cockroach/issues/41522)")
+	}
 
 	mustExec(t, listener, "listen chat")
 
@@ -511,6 +653,7 @@ func TestListenNotify(t *testing.T) {
 	defer cancel()
 	notification, err = listener.WaitForNotification(ctx)
 	assert.True(t, pgconn.Timeout(err))
+	assert.Nil(t, notification)
 
 	// listener can listen again after a timeout
 	mustExec(t, notifier, "notify chat")
@@ -522,8 +665,15 @@ func TestListenNotify(t *testing.T) {
 func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 	t.Parallel()
 
+	func() {
+		conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+		defer closeConn(t, conn)
+		pgxtest.SkipCockroachDB(t, conn, "Server does not support LISTEN / NOTIFY (https://github.com/cockroachdb/cockroach/issues/41522)")
+	}()
+
 	listenerDone := make(chan bool)
 	notifierDone := make(chan bool)
+	listening := make(chan bool)
 	go func() {
 		conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 		defer closeConn(t, conn)
@@ -532,6 +682,7 @@ func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 		}()
 
 		mustExec(t, conn, "listen busysafe")
+		listening <- true
 
 		for i := 0; i < 5000; i++ {
 			var sum int32
@@ -539,31 +690,34 @@ func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 
 			rows, err := conn.Query(context.Background(), "select generate_series(1,$1)", 100)
 			if err != nil {
-				t.Fatalf("conn.Query failed: %v", err)
+				t.Errorf("conn.Query failed: %v", err)
+				return
 			}
 
 			for rows.Next() {
 				var n int32
 				if err := rows.Scan(&n); err != nil {
-					t.Fatalf("Row scan failed: %v", err)
+					t.Errorf("Row scan failed: %v", err)
+					return
 				}
 				sum += n
 				rowCount++
 			}
 
 			if rows.Err() != nil {
-				t.Fatalf("conn.Query failed: %v", err)
+				t.Errorf("conn.Query failed: %v", rows.Err())
+				return
 			}
 
 			if sum != 5050 {
-				t.Fatalf("Wrong rows sum: %v", sum)
+				t.Errorf("Wrong rows sum: %v", sum)
+				return
 			}
 
 			if rowCount != 100 {
-				t.Fatalf("Wrong number of rows: %v", rowCount)
+				t.Errorf("Wrong number of rows: %v", rowCount)
+				return
 			}
-
-			time.Sleep(1 * time.Microsecond)
 		}
 	}()
 
@@ -574,9 +728,10 @@ func TestListenNotifyWhileBusyIsSafe(t *testing.T) {
 			notifierDone <- true
 		}()
 
+		<-listening
+
 		for i := 0; i < 100000; i++ {
 			mustExec(t, conn, "notify busysafe, 'hello'")
-			time.Sleep(1 * time.Microsecond)
 		}
 	}()
 
@@ -589,6 +744,8 @@ func TestListenNotifySelfNotification(t *testing.T) {
 
 	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, conn)
+
+	pgxtest.SkipCockroachDB(t, conn, "Server does not support LISTEN / NOTIFY (https://github.com/cockroachdb/cockroach/issues/41522)")
 
 	mustExec(t, conn, "listen self")
 
@@ -623,6 +780,8 @@ func TestFatalRxError(t *testing.T) {
 	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, conn)
 
+	pgxtest.SkipCockroachDB(t, conn, "Server does not support pg_terminate_backend() (https://github.com/cockroachdb/cockroach/issues/35897)")
+
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -632,7 +791,8 @@ func TestFatalRxError(t *testing.T) {
 		err := conn.QueryRow(context.Background(), "select 1::int4, pg_sleep(10)::varchar").Scan(&n, &s)
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Severity == "FATAL" {
 		} else {
-			t.Fatalf("Expected QueryRow Scan to return fatal PgError, but instead received %v", err)
+			t.Errorf("Expected QueryRow Scan to return fatal PgError, but instead received %v", err)
+			return
 		}
 	}()
 
@@ -659,6 +819,8 @@ func TestFatalTxError(t *testing.T) {
 			conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 			defer closeConn(t, conn)
 
+			pgxtest.SkipCockroachDB(t, conn, "Server does not support pg_terminate_backend() (https://github.com/cockroachdb/cockroach/issues/35897)")
+
 			otherConn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 			defer otherConn.Close(context.Background())
 
@@ -682,13 +844,16 @@ func TestFatalTxError(t *testing.T) {
 func TestInsertBoolArray(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		if results := mustExec(t, conn, "create temporary table foo(spice bool[]);"); string(results) != "CREATE TABLE" {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		if results := mustExec(t, conn, "create temporary table foo(spice bool[]);"); results.String() != "CREATE TABLE" {
 			t.Error("Unexpected results from Exec")
 		}
 
 		// Accept parameters
-		if results := mustExec(t, conn, "insert into foo(spice) values($1)", []bool{true, false, true}); string(results) != "INSERT 0 1" {
+		if results := mustExec(t, conn, "insert into foo(spice) values($1)", []bool{true, false, true}); results.String() != "INSERT 0 1" {
 			t.Errorf("Unexpected results from Exec: %v", results)
 		}
 	})
@@ -697,58 +862,19 @@ func TestInsertBoolArray(t *testing.T) {
 func TestInsertTimestampArray(t *testing.T) {
 	t.Parallel()
 
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		if results := mustExec(t, conn, "create temporary table foo(spice timestamp[]);"); string(results) != "CREATE TABLE" {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		if results := mustExec(t, conn, "create temporary table foo(spice timestamp[]);"); results.String() != "CREATE TABLE" {
 			t.Error("Unexpected results from Exec")
 		}
 
 		// Accept parameters
-		if results := mustExec(t, conn, "insert into foo(spice) values($1)", []time.Time{time.Unix(1419143667, 0), time.Unix(1419143672, 0)}); string(results) != "INSERT 0 1" {
+		if results := mustExec(t, conn, "insert into foo(spice) values($1)", []time.Time{time.Unix(1419143667, 0), time.Unix(1419143672, 0)}); results.String() != "INSERT 0 1" {
 			t.Errorf("Unexpected results from Exec: %v", results)
 		}
 	})
-}
-
-type testLog struct {
-	lvl  pgx.LogLevel
-	msg  string
-	data map[string]interface{}
-}
-
-type testLogger struct {
-	logs []testLog
-}
-
-func (l *testLogger) Log(ctx context.Context, level pgx.LogLevel, msg string, data map[string]interface{}) {
-	data["ctxdata"] = ctx.Value("ctxdata")
-	l.logs = append(l.logs, testLog{lvl: level, msg: msg, data: data})
-}
-
-func TestLogPassesContext(t *testing.T) {
-	t.Parallel()
-
-	l1 := &testLogger{}
-	config := mustParseConfig(t, os.Getenv("PGX_TEST_DATABASE"))
-	config.Logger = l1
-
-	conn := mustConnect(t, config)
-	defer closeConn(t, conn)
-
-	l1.logs = l1.logs[0:0] // Clear logs written when establishing connection
-
-	ctx := context.WithValue(context.Background(), "ctxdata", "foo")
-
-	if _, err := conn.Exec(ctx, ";"); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(l1.logs) != 1 {
-		t.Fatal("Expected logger to be called once, but it wasn't")
-	}
-
-	if l1.logs[0].data["ctxdata"] != "foo" {
-		t.Fatal("Expected context data to be passed to logger, but it wasn't")
-	}
 }
 
 func TestIdentifierSanitize(t *testing.T) {
@@ -792,7 +918,7 @@ func TestIdentifierSanitize(t *testing.T) {
 	}
 }
 
-func TestConnInitConnInfo(t *testing.T) {
+func TestConnInitTypeMap(t *testing.T) {
 	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
 	defer closeConn(t, conn)
 
@@ -804,11 +930,11 @@ func TestConnInitConnInfo(t *testing.T) {
 		"text":  pgtype.TextOID,
 	}
 	for name, oid := range nameOIDs {
-		dtByName, ok := conn.ConnInfo().DataTypeForName(name)
+		dtByName, ok := conn.TypeMap().TypeForName(name)
 		if !ok {
 			t.Fatalf("Expected type named %v to be present", name)
 		}
-		dtByOID, ok := conn.ConnInfo().DataTypeForOID(oid)
+		dtByOID, ok := conn.TypeMap().TypeForOID(oid)
 		if !ok {
 			t.Fatalf("Expected type OID %v to be present", oid)
 		}
@@ -821,7 +947,12 @@ func TestConnInitConnInfo(t *testing.T) {
 }
 
 func TestUnregisteredTypeUsableAsStringArgumentAndBaseResult(t *testing.T) {
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support domain types (https://github.com/cockroachdb/cockroach/issues/27796)")
+
 		var n uint64
 		err := conn.QueryRow(context.Background(), "select $1::uint64", "42").Scan(&n)
 		if err != nil {
@@ -835,47 +966,455 @@ func TestUnregisteredTypeUsableAsStringArgumentAndBaseResult(t *testing.T) {
 }
 
 func TestDomainType(t *testing.T) {
-	testWithAndWithoutPreferSimpleProtocol(t, func(t *testing.T, conn *pgx.Conn) {
-		var n uint64
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support domain types (https://github.com/cockroachdb/cockroach/issues/27796)")
 
 		// Domain type uint64 is a PostgreSQL domain of underlying type numeric.
 
-		err := conn.QueryRow(context.Background(), "select $1::uint64", uint64(24)).Scan(&n)
+		// In the extended protocol preparing "select $1::uint64" appears to create a statement that expects a param OID of
+		// uint64 but a result OID of the underlying numeric.
+
+		var s string
+		err := conn.QueryRow(ctx, "select $1::uint64", "24").Scan(&s)
+		require.NoError(t, err)
+		require.Equal(t, "24", s)
+
+		// Register type
+		uint64Type, err := conn.LoadType(ctx, "uint64")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(uint64Type)
+
+		var n uint64
+		err = conn.QueryRow(ctx, "select $1::uint64", uint64(24)).Scan(&n)
 		require.NoError(t, err)
 
-		// A string can be used. But a string cannot be the result because the describe result from the PostgreSQL server gives
-		// the underlying type of numeric.
-		err = conn.QueryRow(context.Background(), "select $1::uint64", "42").Scan(&n)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if n != 42 {
-			t.Fatalf("Expected n to be 42, but was %v", n)
-		}
-
-		var uint64OID uint32
-		err = conn.QueryRow(context.Background(), "select t.oid from pg_type t where t.typname='uint64';").Scan(&uint64OID)
-		if err != nil {
-			t.Fatalf("did not find uint64 OID, %v", err)
-		}
-		conn.ConnInfo().RegisterDataType(pgtype.DataType{Value: &pgtype.Numeric{}, Name: "uint64", OID: uint64OID})
-
 		// String is still an acceptable argument after registration
-		err = conn.QueryRow(context.Background(), "select $1::uint64", "7").Scan(&n)
+		err = conn.QueryRow(ctx, "select $1::uint64", "7").Scan(&n)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if n != 7 {
 			t.Fatalf("Expected n to be 7, but was %v", n)
 		}
-
-		// But a uint64 is acceptable
-		err = conn.QueryRow(context.Background(), "select $1::uint64", uint64(24)).Scan(&n)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if n != 24 {
-			t.Fatalf("Expected n to be 24, but was %v", n)
-		}
 	})
+}
+
+func TestLoadTypeSameNameInDifferentSchemas(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support composite types (https://github.com/cockroachdb/cockroach/issues/27792)")
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+
+		_, err = tx.Exec(ctx, `create schema pgx_a;
+create type pgx_a.point as (a text, b text);
+create schema pgx_b;
+create type pgx_b.point as (c text);
+`)
+		require.NoError(t, err)
+
+		// Register types
+		for _, typename := range []string{"pgx_a.point", "pgx_b.point"} {
+			// Obviously using conn while a tx is in use and registering a type after the connection has been established are
+			// really bad practices, but for the sake of convenience we do it in the test here.
+			dt, err := conn.LoadType(ctx, typename)
+			require.NoError(t, err)
+			conn.TypeMap().RegisterType(dt)
+		}
+
+		type aPoint struct {
+			A string
+			B string
+		}
+
+		type bPoint struct {
+			C string
+		}
+
+		var a aPoint
+		var b bPoint
+		err = tx.QueryRow(ctx, `select '(foo,bar)'::pgx_a.point, '(baz)'::pgx_b.point`).Scan(&a, &b)
+		require.NoError(t, err)
+		require.Equal(t, aPoint{"foo", "bar"}, a)
+		require.Equal(t, bPoint{"baz"}, b)
+	})
+}
+
+func TestLoadCompositeType(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support composite types (https://github.com/cockroachdb/cockroach/issues/27792)")
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+
+		_, err = tx.Exec(ctx, "create type compositetype as (attr1 int, attr2 int)")
+		require.NoError(t, err)
+
+		_, err = tx.Exec(ctx, "alter type compositetype drop attribute attr1")
+		require.NoError(t, err)
+
+		_, err = conn.LoadType(ctx, "compositetype")
+		require.NoError(t, err)
+	})
+}
+
+func TestLoadRangeType(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support range types")
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+
+		_, err = tx.Exec(ctx, "create type examplefloatrange as range (subtype=float8, subtype_diff=float8mi)")
+		require.NoError(t, err)
+
+		// Register types
+		newRangeType, err := conn.LoadType(ctx, "examplefloatrange")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(newRangeType)
+		conn.TypeMap().RegisterDefaultPgType(pgtype.Range[float64]{}, "examplefloatrange")
+
+		var inputRangeType = pgtype.Range[float64]{
+			Lower:     1.0,
+			Upper:     2.0,
+			LowerType: pgtype.Inclusive,
+			UpperType: pgtype.Inclusive,
+			Valid:     true,
+		}
+		var outputRangeType pgtype.Range[float64]
+		err = tx.QueryRow(ctx, "SELECT $1::examplefloatrange", inputRangeType).Scan(&outputRangeType)
+		require.NoError(t, err)
+		require.Equal(t, inputRangeType, outputRangeType)
+	})
+}
+
+func TestLoadMultiRangeType(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "Server does support range types")
+		pgxtest.SkipPostgreSQLVersionLessThan(t, conn, 14) // multirange data type was added in 14 postgresql
+
+		tx, err := conn.Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+
+		_, err = tx.Exec(ctx, "create type examplefloatrange as range (subtype=float8, subtype_diff=float8mi, multirange_type_name=examplefloatmultirange)")
+		require.NoError(t, err)
+
+		// Register types
+		newRangeType, err := conn.LoadType(ctx, "examplefloatrange")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(newRangeType)
+		conn.TypeMap().RegisterDefaultPgType(pgtype.Range[float64]{}, "examplefloatrange")
+
+		newMultiRangeType, err := conn.LoadType(ctx, "examplefloatmultirange")
+		require.NoError(t, err)
+		conn.TypeMap().RegisterType(newMultiRangeType)
+		conn.TypeMap().RegisterDefaultPgType(pgtype.Multirange[pgtype.Range[float64]]{}, "examplefloatmultirange")
+
+		var inputMultiRangeType = pgtype.Multirange[pgtype.Range[float64]]{
+			{
+				Lower:     1.0,
+				Upper:     2.0,
+				LowerType: pgtype.Inclusive,
+				UpperType: pgtype.Inclusive,
+				Valid:     true,
+			},
+			{
+				Lower:     3.0,
+				Upper:     4.0,
+				LowerType: pgtype.Exclusive,
+				UpperType: pgtype.Exclusive,
+				Valid:     true,
+			},
+		}
+		var outputMultiRangeType pgtype.Multirange[pgtype.Range[float64]]
+		err = tx.QueryRow(ctx, "SELECT $1::examplefloatmultirange", inputMultiRangeType).Scan(&outputMultiRangeType)
+		require.NoError(t, err)
+		require.Equal(t, inputMultiRangeType, outputMultiRangeType)
+	})
+}
+
+func TestStmtCacheInvalidationConn(t *testing.T) {
+	ctx := context.Background()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	// create a table and fill it with some data
+	_, err := conn.Exec(ctx, `
+        DROP TABLE IF EXISTS drop_cols;
+        CREATE TABLE drop_cols (
+            id SERIAL PRIMARY KEY NOT NULL,
+            f1 int NOT NULL,
+            f2 int NOT NULL
+        );
+    `)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "INSERT INTO drop_cols (f1, f2) VALUES (1, 2)")
+	require.NoError(t, err)
+
+	getSQL := "SELECT * FROM drop_cols WHERE id = $1"
+
+	// This query will populate the statement cache. We don't care about the result.
+	rows, err := conn.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+
+	// Now, change the schema of the table out from under the statement, making it invalid.
+	_, err = conn.Exec(ctx, "ALTER TABLE drop_cols DROP COLUMN f1")
+	require.NoError(t, err)
+
+	// We must get an error the first time we try to re-execute a bad statement.
+	// It is up to the application to determine if it wants to try again. We punt to
+	// the application because there is no clear recovery path in the case of failed transactions
+	// or batch operations and because automatic retry is tricky and we don't want to get
+	// it wrong at such an importaint layer of the stack.
+	rows, err = conn.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Next()
+	nextErr := rows.Err()
+	rows.Close()
+	for _, err := range []error{nextErr, rows.Err()} {
+		if err == nil {
+			t.Fatal(`expected "cached plan must not change result type": no error`)
+		}
+		if !strings.Contains(err.Error(), "cached plan must not change result type") {
+			t.Fatalf(`expected "cached plan must not change result type", got: "%s"`, err.Error())
+		}
+	}
+
+	// On retry, the statement should have been flushed from the cache.
+	rows, err = conn.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Next()
+	err = rows.Err()
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+
+	ensureConnValid(t, conn)
+}
+
+func TestStmtCacheInvalidationTx(t *testing.T) {
+	ctx := context.Background()
+
+	conn := mustConnectString(t, os.Getenv("PGX_TEST_DATABASE"))
+	defer closeConn(t, conn)
+
+	if conn.PgConn().ParameterStatus("crdb_version") != "" {
+		t.Skip("Server has non-standard prepare in errored transaction behavior (https://github.com/cockroachdb/cockroach/issues/84140)")
+	}
+
+	// create a table and fill it with some data
+	_, err := conn.Exec(ctx, `
+        DROP TABLE IF EXISTS drop_cols;
+        CREATE TABLE drop_cols (
+            id SERIAL PRIMARY KEY NOT NULL,
+            f1 int NOT NULL,
+            f2 int NOT NULL
+        );
+    `)
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "INSERT INTO drop_cols (f1, f2) VALUES (1, 2)")
+	require.NoError(t, err)
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+
+	getSQL := "SELECT * FROM drop_cols WHERE id = $1"
+
+	// This query will populate the statement cache. We don't care about the result.
+	rows, err := tx.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Close()
+	require.NoError(t, rows.Err())
+
+	// Now, change the schema of the table out from under the statement, making it invalid.
+	_, err = tx.Exec(ctx, "ALTER TABLE drop_cols DROP COLUMN f1")
+	require.NoError(t, err)
+
+	// We must get an error the first time we try to re-execute a bad statement.
+	// It is up to the application to determine if it wants to try again. We punt to
+	// the application because there is no clear recovery path in the case of failed transactions
+	// or batch operations and because automatic retry is tricky and we don't want to get
+	// it wrong at such an importaint layer of the stack.
+	rows, err = tx.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Next()
+	nextErr := rows.Err()
+	rows.Close()
+	for _, err := range []error{nextErr, rows.Err()} {
+		if err == nil {
+			t.Fatal(`expected "cached plan must not change result type": no error`)
+		}
+		if !strings.Contains(err.Error(), "cached plan must not change result type") {
+			t.Fatalf(`expected "cached plan must not change result type", got: "%s"`, err.Error())
+		}
+	}
+
+	rows, _ = tx.Query(ctx, getSQL, 1)
+	rows.Close()
+	err = rows.Err()
+	// Retries within the same transaction are errors (really anything except a rollback
+	// will be an error in this transaction).
+	require.Error(t, err)
+	rows.Close()
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	// once we've rolled back, retries will work
+	rows, err = conn.Query(ctx, getSQL, 1)
+	require.NoError(t, err)
+	rows.Next()
+	err = rows.Err()
+	require.NoError(t, err)
+	rows.Close()
+
+	ensureConnValid(t, conn)
+}
+
+func TestInsertDurationInterval(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		_, err := conn.Exec(context.Background(), "create temporary table t(duration INTERVAL(0) NOT NULL)")
+		require.NoError(t, err)
+
+		result, err := conn.Exec(context.Background(), "insert into t(duration) values($1)", time.Minute)
+		require.NoError(t, err)
+
+		n := result.RowsAffected()
+		require.EqualValues(t, 1, n)
+	})
+}
+
+func TestRawValuesUnderlyingMemoryReused(t *testing.T) {
+	defaultConnTestRunner.RunTest(context.Background(), t, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		var buf []byte
+
+		rows, err := conn.Query(ctx, `select 1::int`)
+		require.NoError(t, err)
+
+		for rows.Next() {
+			buf = rows.RawValues()[0]
+		}
+
+		require.NoError(t, rows.Err())
+
+		original := make([]byte, len(buf))
+		copy(original, buf)
+
+		for i := 0; i < 1_000_000; i++ {
+			rows, err := conn.Query(ctx, `select $1::int`, i)
+			require.NoError(t, err)
+			rows.Close()
+			require.NoError(t, rows.Err())
+
+			if !bytes.Equal(original, buf) {
+				return
+			}
+		}
+
+		t.Fatal("expected buffer from RawValues to be overwritten by subsequent queries but it was not")
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1847
+func TestConnDeallocateInvalidatedCachedStatementsWhenCanceled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pgxtest.RunWithQueryExecModes(ctx, t, defaultConnTestRunner, nil, func(ctx context.Context, t testing.TB, conn *pgx.Conn) {
+		pgxtest.SkipCockroachDB(t, conn, "CockroachDB returns decimal instead of integer for integer division")
+
+		var n int32
+		err := conn.QueryRow(ctx, "select 1 / $1::int", 1).Scan(&n)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, n)
+
+		// Divide by zero causes an error. baseRows.Close() calls Invalidate on the statement cache whenever an error was
+		// encountered by the query. Use this to purposely invalidate the query. If we had access to private fields of conn
+		// we could call conn.statementCache.InvalidateAll() instead.
+		err = conn.QueryRow(ctx, "select 1 / $1::int", 0).Scan(&n)
+		require.Error(t, err)
+
+		ctx2, cancel2 := context.WithCancel(ctx)
+		cancel2()
+		err = conn.QueryRow(ctx2, "select 1 / $1::int", 1).Scan(&n)
+		require.Error(t, err)
+		require.ErrorIs(t, err, context.Canceled)
+
+		err = conn.QueryRow(ctx, "select 1 / $1::int", 1).Scan(&n)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, n)
+	})
+}
+
+// https://github.com/jackc/pgx/issues/1847
+func TestConnDeallocateInvalidatedCachedStatementsInTransactionWithBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	connString := os.Getenv("PGX_TEST_DATABASE")
+	config := mustParseConfig(t, connString)
+	config.DefaultQueryExecMode = pgx.QueryExecModeCacheStatement
+	config.StatementCacheCapacity = 2
+
+	conn, err := pgx.ConnectConfig(ctx, config)
+	require.NoError(t, err)
+
+	tx, err := conn.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, "select $1::int + 1", 1)
+	require.NoError(t, err)
+
+	_, err = tx.Exec(ctx, "select $1::int + 2", 1)
+	require.NoError(t, err)
+
+	// This should invalidate the first cached statement.
+	_, err = tx.Exec(ctx, "select $1::int + 3", 1)
+	require.NoError(t, err)
+
+	batch := &pgx.Batch{}
+	batch.Queue("select $1::int + 1", 1)
+	err = tx.SendBatch(ctx, batch).Close()
+	require.NoError(t, err)
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	ensureConnValid(t, conn)
+}
+
+func TestErrNoRows(t *testing.T) {
+	t.Parallel()
+
+	// ensure we preserve old error message
+	require.Equal(t, "no rows in result set", pgx.ErrNoRows.Error())
+
+	require.ErrorIs(t, pgx.ErrNoRows, sql.ErrNoRows, "pgx.ErrNowRows must match sql.ErrNoRows")
 }

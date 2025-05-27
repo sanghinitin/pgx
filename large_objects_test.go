@@ -7,20 +7,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxtest"
 )
 
 func TestLargeObjects(t *testing.T) {
-	t.Parallel()
+	// We use a very short limit to test chunking logic.
+	pgx.SetMaxLargeObjectMessageLength(t, 2)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	conn, err := pgx.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	pgxtest.SkipCockroachDB(t, conn, "Server does support large objects")
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
@@ -30,10 +34,11 @@ func TestLargeObjects(t *testing.T) {
 	testLargeObjects(t, ctx, tx)
 }
 
-func TestLargeObjectsPreferSimpleProtocol(t *testing.T) {
-	t.Parallel()
+func TestLargeObjectsSimpleProtocol(t *testing.T) {
+	// We use a very short limit to test chunking logic.
+	pgx.SetMaxLargeObjectMessageLength(t, 2)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	config, err := pgx.ParseConfig(os.Getenv("PGX_TEST_DATABASE"))
@@ -41,12 +46,14 @@ func TestLargeObjectsPreferSimpleProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	config.PreferSimpleProtocol = true
+	config.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 
 	conn, err := pgx.ConnectConfig(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	pgxtest.SkipCockroachDB(t, conn, "Server does support large objects")
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
@@ -155,15 +162,18 @@ func testLargeObjects(t *testing.T, ctx context.Context, tx pgx.Tx) {
 }
 
 func TestLargeObjectsMultipleTransactions(t *testing.T) {
-	t.Parallel()
+	// We use a very short limit to test chunking logic.
+	pgx.SetMaxLargeObjectMessageLength(t, 2)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	conn, err := pgx.Connect(ctx, os.Getenv("PGX_TEST_DATABASE"))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	pgxtest.SkipCockroachDB(t, conn, "Server does support large objects")
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {

@@ -1,168 +1,146 @@
 package pgx
 
 import (
-	"database/sql/driver"
 	"fmt"
-	"reflect"
 
-	"github.com/jackc/pgtype"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type extendedQueryBuilder struct {
-	paramValues     [][]byte
+// ExtendedQueryBuilder is used to choose the parameter formats, to format the parameters and to choose the result
+// formats for an extended query.
+type ExtendedQueryBuilder struct {
+	ParamValues     [][]byte
 	paramValueBytes []byte
-	paramFormats    []int16
-	resultFormats   []int16
-
-	resetCount int
+	ParamFormats    []int16
+	ResultFormats   []int16
 }
 
-func (eqb *extendedQueryBuilder) AppendParam(ci *pgtype.ConnInfo, oid uint32, arg interface{}) error {
-	f := chooseParameterFormatCode(ci, oid, arg)
-	eqb.paramFormats = append(eqb.paramFormats, f)
+// Build sets ParamValues, ParamFormats, and ResultFormats for use with *PgConn.ExecParams or *PgConn.ExecPrepared. If
+// sd is nil then QueryExecModeExec behavior will be used.
+func (eqb *ExtendedQueryBuilder) Build(m *pgtype.Map, sd *pgconn.StatementDescription, args []any) error {
+	eqb.reset()
 
-	v, err := eqb.encodeExtendedParamValue(ci, oid, f, arg)
-	if err != nil {
-		return err
+	if sd == nil {
+		for i := range args {
+			err := eqb.appendParam(m, 0, pgtype.TextFormatCode, args[i])
+			if err != nil {
+				err = fmt.Errorf("failed to encode args[%d]: %w", i, err)
+				return err
+			}
+		}
+		return nil
 	}
-	eqb.paramValues = append(eqb.paramValues, v)
+
+	if len(sd.ParamOIDs) != len(args) {
+		return fmt.Errorf("mismatched param and argument count")
+	}
+
+	for i := range args {
+		err := eqb.appendParam(m, sd.ParamOIDs[i], -1, args[i])
+		if err != nil {
+			err = fmt.Errorf("failed to encode args[%d]: %w", i, err)
+			return err
+		}
+	}
+
+	for i := range sd.Fields {
+		eqb.appendResultFormat(m.FormatCodeForOID(sd.Fields[i].DataTypeOID))
+	}
 
 	return nil
 }
 
-func (eqb *extendedQueryBuilder) AppendResultFormat(f int16) {
-	eqb.resultFormats = append(eqb.resultFormats, f)
+// appendParam appends a parameter to the query. format may be -1 to automatically choose the format. If arg is nil it
+// must be an untyped nil.
+func (eqb *ExtendedQueryBuilder) appendParam(m *pgtype.Map, oid uint32, format int16, arg any) error {
+	if format == -1 {
+		preferredFormat := eqb.chooseParameterFormatCode(m, oid, arg)
+		preferredErr := eqb.appendParam(m, oid, preferredFormat, arg)
+		if preferredErr == nil {
+			return nil
+		}
+
+		var otherFormat int16
+		if preferredFormat == TextFormatCode {
+			otherFormat = BinaryFormatCode
+		} else {
+			otherFormat = TextFormatCode
+		}
+
+		otherErr := eqb.appendParam(m, oid, otherFormat, arg)
+		if otherErr == nil {
+			return nil
+		}
+
+		return preferredErr // return the error from the preferred format
+	}
+
+	v, err := eqb.encodeExtendedParamValue(m, oid, format, arg)
+	if err != nil {
+		return err
+	}
+
+	eqb.ParamFormats = append(eqb.ParamFormats, format)
+	eqb.ParamValues = append(eqb.ParamValues, v)
+
+	return nil
 }
 
-func (eqb *extendedQueryBuilder) Reset() {
-	eqb.paramValues = eqb.paramValues[0:0]
+// appendResultFormat appends a result format to the query.
+func (eqb *ExtendedQueryBuilder) appendResultFormat(format int16) {
+	eqb.ResultFormats = append(eqb.ResultFormats, format)
+}
+
+// reset readies eqb to build another query.
+func (eqb *ExtendedQueryBuilder) reset() {
+	eqb.ParamValues = eqb.ParamValues[0:0]
 	eqb.paramValueBytes = eqb.paramValueBytes[0:0]
-	eqb.paramFormats = eqb.paramFormats[0:0]
-	eqb.resultFormats = eqb.resultFormats[0:0]
+	eqb.ParamFormats = eqb.ParamFormats[0:0]
+	eqb.ResultFormats = eqb.ResultFormats[0:0]
 
-	eqb.resetCount++
-
-	// Every so often shrink our reserved memory if it is abnormally high
-	if eqb.resetCount%128 == 0 {
-		if cap(eqb.paramValues) > 64 {
-			eqb.paramValues = make([][]byte, 0, cap(eqb.paramValues)/2)
-		}
-
-		if cap(eqb.paramValueBytes) > 256 {
-			eqb.paramValueBytes = make([]byte, 0, cap(eqb.paramValueBytes)/2)
-		}
-
-		if cap(eqb.paramFormats) > 64 {
-			eqb.paramFormats = make([]int16, 0, cap(eqb.paramFormats)/2)
-		}
-		if cap(eqb.resultFormats) > 64 {
-			eqb.resultFormats = make([]int16, 0, cap(eqb.resultFormats)/2)
-		}
+	if cap(eqb.ParamValues) > 64 {
+		eqb.ParamValues = make([][]byte, 0, 64)
 	}
 
+	if cap(eqb.paramValueBytes) > 256 {
+		eqb.paramValueBytes = make([]byte, 0, 256)
+	}
+
+	if cap(eqb.ParamFormats) > 64 {
+		eqb.ParamFormats = make([]int16, 0, 64)
+	}
+	if cap(eqb.ResultFormats) > 64 {
+		eqb.ResultFormats = make([]int16, 0, 64)
+	}
 }
 
-func (eqb *extendedQueryBuilder) encodeExtendedParamValue(ci *pgtype.ConnInfo, oid uint32, formatCode int16, arg interface{}) ([]byte, error) {
-	if arg == nil {
-		return nil, nil
-	}
-
-	refVal := reflect.ValueOf(arg)
-	argIsPtr := refVal.Kind() == reflect.Ptr
-
-	if argIsPtr && refVal.IsNil() {
-		return nil, nil
-	}
-
+func (eqb *ExtendedQueryBuilder) encodeExtendedParamValue(m *pgtype.Map, oid uint32, formatCode int16, arg any) ([]byte, error) {
 	if eqb.paramValueBytes == nil {
 		eqb.paramValueBytes = make([]byte, 0, 128)
 	}
 
-	var err error
-	var buf []byte
 	pos := len(eqb.paramValueBytes)
 
-	if arg, ok := arg.(string); ok {
-		return []byte(arg), nil
+	buf, err := m.Encode(oid, formatCode, arg, eqb.paramValueBytes)
+	if err != nil {
+		return nil, err
+	}
+	if buf == nil {
+		return nil, nil
+	}
+	eqb.paramValueBytes = buf
+	return eqb.paramValueBytes[pos:], nil
+}
+
+// chooseParameterFormatCode determines the correct format code for an
+// argument to a prepared statement. It defaults to TextFormatCode if no
+// determination can be made.
+func (eqb *ExtendedQueryBuilder) chooseParameterFormatCode(m *pgtype.Map, oid uint32, arg any) int16 {
+	switch arg.(type) {
+	case string, *string:
+		return TextFormatCode
 	}
 
-	if formatCode == TextFormatCode {
-		if arg, ok := arg.(pgtype.TextEncoder); ok {
-			buf, err = arg.EncodeText(ci, eqb.paramValueBytes)
-			if err != nil {
-				return nil, err
-			}
-			if buf == nil {
-				return nil, nil
-			}
-			eqb.paramValueBytes = buf
-			return eqb.paramValueBytes[pos:], nil
-		}
-	} else if formatCode == BinaryFormatCode {
-		if arg, ok := arg.(pgtype.BinaryEncoder); ok {
-			buf, err = arg.EncodeBinary(ci, eqb.paramValueBytes)
-			if err != nil {
-				return nil, err
-			}
-			if buf == nil {
-				return nil, nil
-			}
-			eqb.paramValueBytes = buf
-			return eqb.paramValueBytes[pos:], nil
-		}
-	}
-
-	if argIsPtr {
-		// We have already checked that arg is not pointing to nil,
-		// so it is safe to dereference here.
-		arg = refVal.Elem().Interface()
-		return eqb.encodeExtendedParamValue(ci, oid, formatCode, arg)
-	}
-
-	if dt, ok := ci.DataTypeForOID(oid); ok {
-		value := dt.Value
-		err := value.Set(arg)
-		if err != nil {
-			{
-				if arg, ok := arg.(driver.Valuer); ok {
-					v, err := callValuerValue(arg)
-					if err != nil {
-						return nil, err
-					}
-					return eqb.encodeExtendedParamValue(ci, oid, formatCode, v)
-				}
-			}
-
-			return nil, err
-		}
-
-		return eqb.encodeExtendedParamValue(ci, oid, formatCode, value)
-	}
-
-	// There is no data type registered for the destination OID, but maybe there is data type registered for the arg
-	// type. If so use it's text encoder (if available).
-	if dt, ok := ci.DataTypeForValue(arg); ok {
-		value := dt.Value
-		if textEncoder, ok := value.(pgtype.TextEncoder); ok {
-			err := value.Set(arg)
-			if err != nil {
-				return nil, err
-			}
-
-			buf, err = textEncoder.EncodeText(ci, eqb.paramValueBytes)
-			if err != nil {
-				return nil, err
-			}
-			if buf == nil {
-				return nil, nil
-			}
-			eqb.paramValueBytes = buf
-			return eqb.paramValueBytes[pos:], nil
-		}
-	}
-
-	if strippedArg, ok := stripNamedType(&refVal); ok {
-		return eqb.encodeExtendedParamValue(ci, oid, formatCode, strippedArg)
-	}
-	return nil, SerializationError(fmt.Sprintf("Cannot encode %T into oid %v - %T must implement Encoder or be converted to a string", arg, oid, arg))
+	return m.FormatCodeForOID(oid)
 }
